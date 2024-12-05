@@ -358,13 +358,11 @@ defmodule Depot.Adapter.ETS do
     |> :ets.tab2list()
     |> Enum.reduce(%{}, fn {file_path, {content, meta}}, acc ->
       case check_path_in_directory(file_path, normalized_path) do
-        {:direct_child, name} ->
+        {:direct_child, name} when name not in [".", ".."] ->
           if Map.has_key?(acc, name) do
-            # If we already have a directory entry, keep it
             if match?(%Depot.Stat.Dir{}, acc[name]) do
               acc
             else
-              # Otherwise, check if this is a directory
               case content do
                 map when is_map(map) ->
                   Map.put(acc, name, create_stat_struct(name, content, meta))
