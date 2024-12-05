@@ -68,23 +68,23 @@ defmodule Depot.Adapter.S3 do
           |> ExAws.request(config.config)
 
         collector_fun = fn
-          %{acc: acc} = data, {:cont, elem}
+          %{acc: acc, index: index, etags: etags} = data, {:cont, elem}
           when byte_size(acc) + byte_size(elem) >= @min_part_size ->
-            data = acc <> elem
-            etag = upload_part(config, path, upload_id, data.index, data, opts)
-            %{data | acc: "", index: data.index + 1, etags: [{data.index + 1, etag} | data.etags]}
+            new_data = acc <> elem
+            etag = upload_part(config, path, upload_id, index, new_data, opts)
+            %{data | acc: "", index: index + 1, etags: [{index + 1, etag} | etags]}
 
           %{acc: acc} = data, {:cont, elem} ->
             %{data | acc: acc <> elem}
 
-          %{acc: acc} = data, :done when byte_size(acc) > 0 ->
-            etag = upload_part(config, path, upload_id, data.index, acc, opts)
+          %{acc: acc, index: index, etags: etags} = data, :done when byte_size(acc) > 0 ->
+            etag = upload_part(config, path, upload_id, index, acc, opts)
 
             data = %{
               data
               | acc: "",
-                index: data.index + 1,
-                etags: [{data.index + 1, etag} | data.etags]
+                index: index + 1,
+                etags: [{index + 1, etag} | etags]
             }
 
             {:ok, _} =
@@ -133,7 +133,7 @@ defmodule Depot.Adapter.S3 do
     end
   end
 
-  defp clear_visibility_store do
+  def reset_visibility_store do
     :persistent_term.put(@visibility_key, %{})
   end
 
@@ -275,13 +275,13 @@ defmodule Depot.Adapter.S3 do
   end
 
   @impl Depot.Adapter
-  def copy(%Config{} = config, source, destination, opts) do
-    copy(config, source, destination, config, opts)
+  def copy(%Config{} = source_config, source, destination, dest_config, opts) do
+    copy(source_config, source, dest_config, destination, opts)
   end
 
   @impl Depot.Adapter
-  def copy(%Config{} = source_config, source, destination, dest_config, opts) do
-    copy(source_config, source, dest_config, destination, opts)
+  def copy(%Config{} = config, source, destination, opts) do
+    copy(config, source, destination, config, opts)
   end
 
   defp do_copy(config, {source_bucket, source_path}, {destination_bucket, destination_path}, opts) do
@@ -336,7 +336,7 @@ defmodule Depot.Adapter.S3 do
       )
 
     case ExAws.request(operation, config.config) do
-      {:ok, %{body: body} = response} ->
+      {:ok, %{body: body} = _response} ->
         contents = Map.get(body, :contents, [])
         prefixes = Map.get(body, :common_prefixes, [])
 
@@ -465,7 +465,7 @@ defmodule Depot.Adapter.S3 do
 
       :ok
     catch
-      {:delete_failed, key, error} ->
+      {:delete_failed, _key, error} ->
         error
     end
   end
@@ -504,20 +504,6 @@ defmodule Depot.Adapter.S3 do
       :public -> Keyword.put(opts, :acl, "public-read")
       :private -> Keyword.put(opts, :acl, "private")
       _ -> opts
-    end
-  end
-
-  defp get_directory_visibility(config, path) do
-    case visibility(config, path) do
-      {:ok, visibility} -> visibility
-      _ -> :public
-    end
-  end
-
-  defp get_file_visibility(config, path) do
-    case visibility(config, path) do
-      {:ok, visibility} -> visibility
-      _ -> :public
     end
   end
 end
