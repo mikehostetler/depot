@@ -9,8 +9,15 @@ defmodule Depot.RelativePath do
     case relative?(path) do
       true ->
         case expand(path) do
-          {:ok, expanded} -> {:ok, expanded}
-          {:error, :traversal} -> {:error, {:path, :traversal}}
+          {:ok, expanded} ->
+            if String.ends_with?(path, "/") do
+              {:ok, String.trim_trailing(expanded, "/") <> "/"}
+            else
+              {:ok, expanded}
+            end
+
+          {:error, :traversal} ->
+            {:error, {:path, :traversal}}
         end
 
       false ->
