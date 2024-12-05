@@ -1,6 +1,6 @@
 defmodule Depot.Adapter.LocalTest do
   use ExUnit.Case, async: true
-  use Bitwise, only_operators: true
+  import Bitwise
   import Depot.AdapterTest
   doctest Depot.Adapter.Local
 

@@ -42,7 +42,7 @@ defmodule Depot.Adapter.Local do
       {:ok, %File.Stream{mode: [{:encoding, :utf8}, :binary], ...}} = Depot.read_stream(filesystem, "test.txt", modes: [encoding: :utf8])
 
   """
-  use Bitwise, only_operators: true
+  import Bitwise
   alias Depot.Visibility.UnixVisibilityConverter
   alias Depot.Visibility.PortableUnixVisibilityConverter, as: DefaultVisibilityConverter
 
