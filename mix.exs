@@ -12,13 +12,17 @@ defmodule Depot.MixProject do
       package: package(),
       name: "Depot",
       source_url: "https://github.com/elixir-depot/depot",
-      docs: docs()
+      docs: docs(),
+      elixirc_paths: elixirc_paths(Mix.env())
     ]
   end
 
   defp description() do
     "A filesystem abstraction for elixir."
   end
+
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
 
   defp package() do
     [
@@ -53,7 +57,13 @@ defmodule Depot.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:ex_doc, "~> 0.21", only: :dev, runtime: false}
+      {:ex_aws, "~> 2.1"},
+      {:ex_aws_s3, "~> 2.2"},
+      {:hackney, "~> 1.9"},
+      {:sweet_xml, "~> 0.6"},
+      {:minio_server, "~> 0.4.0", only: [:dev, :test]},
+      {:jason, "~> 1.0"},
+      {:ex_doc, "~> 0.35", only: :dev, runtime: false}
     ]
   end
 end
