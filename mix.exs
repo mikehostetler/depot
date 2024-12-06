@@ -63,7 +63,8 @@ defmodule Depot.MixProject do
       {:sweet_xml, "~> 0.6"},
       {:minio_server, "~> 0.4.0", only: [:dev, :test]},
       {:jason, "~> 1.0"},
-      {:ex_doc, "~> 0.35", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.35", only: :dev, runtime: false},
+      {:mix_test_watch, "~> 1.0", only: [:dev, :test], runtime: false}
     ]
   end
 end
