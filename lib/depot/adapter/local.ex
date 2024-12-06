@@ -1,208 +1,165 @@
 defmodule Depot.Adapter.Local do
-  @moduledoc """
-  Depot Adapter for the local filesystem.
+  use Depot.Adapter,
+    scheme: "file",
+    capabilities: [:transformable, :collection, :streamable, :executable]
 
-  ## Direct usage
+  use ExDbug, enabled: false
 
-      iex> prefix = System.tmp_dir!()
-      iex> filesystem = Depot.Adapter.Local.configure(prefix: prefix)
-      iex> :ok = Depot.write(filesystem, "test.txt", "Hello World")
-      iex> {:ok, "Hello World"} = Depot.read(filesystem, "test.txt")
-
-  ## Usage with a module
-
-      defmodule LocalFileSystem do
-        use Depot.Filesystem,
-          adapter: Depot.Adapter.Local,
-          prefix: prefix
-      end
-
-      LocalFileSystem.write("test.txt", "Hello World")
-      {:ok, "Hello World"} = LocalFileSystem.read("test.txt")
-
-  ## Usage with Streams
-
-  The following options are available for streams:
-
-    * `:chunk_size` - When reading, the amount to read,
-      by `:line` (default) or by a given number of bytes.
-
-    * `:modes` - A list of modes to use when opening the file
-      for reading. For more information, see the docs for
-      `File.stream!/3`.
-
-  ### Examples
-
-      {:ok, %File.Stream{}} = Depot.read_stream(filesystem, "test.txt")
-
-      # with custom read chunk size
-      {:ok, %File.Stream{line_or_bytes: 1_024, ...}} = Depot.read_stream(filesystem, "test.txt", chunk_size: 1_024)
-
-      # with custom file read modes
-      {:ok, %File.Stream{mode: [{:encoding, :utf8}, :binary], ...}} = Depot.read_stream(filesystem, "test.txt", modes: [encoding: :utf8])
-
-  """
   import Bitwise
   alias Depot.Visibility.UnixVisibilityConverter
   alias Depot.Visibility.PortableUnixVisibilityConverter, as: DefaultVisibilityConverter
+  @behaviour Depot.Adapter.Stream
+  @behaviour Depot.Adapter.Collection
+  @behaviour Depot.Adapter.Executable
 
-  defmodule Config do
-    @moduledoc false
+  @type t :: %__MODULE__{name: atom(), converter: module(), root_path: binary()}
+  defstruct [:name, :converter, :visibility, :root_path]
 
-    @type t :: %__MODULE__{
-            prefix: Path.t(),
-            converter: UnixVisibilityConverter.t(),
-            visibility: UnixVisibilityConverter.config()
-          }
-
-    defstruct prefix: nil, converter: nil, visibility: nil
-  end
-
-  @behaviour Depot.Adapter
-
-  @impl Depot.Adapter
-  def starts_processes, do: false
-
-  @impl Depot.Adapter
-  def configure(opts) do
+  @impl true
+  def start(opts) when is_list(opts) do
+    name = Keyword.fetch!(opts, :name)
+    root_path = Keyword.get(opts, :root_path, System.tmp_dir!())
     visibility_config = Keyword.get(opts, :visibility, [])
     converter = Keyword.get(visibility_config, :converter, DefaultVisibilityConverter)
     visibility = visibility_config |> Keyword.drop([:converter]) |> converter.config()
 
-    config = %Config{
-      prefix: Keyword.fetch!(opts, :prefix),
-      converter: converter,
-      visibility: visibility
-    }
+    with :ok <- File.mkdir_p(root_path) do
+      {:ok,
+       %__MODULE__{name: name, converter: converter, visibility: visibility, root_path: root_path}}
+    end
+  end
 
-    {__MODULE__, config}
+  @impl true
+  def read(%__MODULE__{} = state, address) do
+    path = local_path(state, address)
+    File.read(path)
   end
 
   @impl Depot.Adapter
-  def write(%Config{} = config, path, contents, opts) do
-    path = full_path(config, path)
+  def write(%__MODULE__{} = state, address, contents, opts \\ [])
+      when is_binary(contents) do
+    path = local_path(state, address)
 
     mode =
       with {:ok, visibility} <- Keyword.fetch(opts, :visibility) do
-        mode = config.converter.for_file(config.visibility, visibility)
+        mode = state.converter.for_file(state.visibility, visibility)
         {:ok, mode}
       end
 
-    with :ok <- ensure_directory(config, Path.dirname(path), opts),
+    with :ok <- ensure_parent_dir(state, address, opts),
          :ok <- File.write(path, contents),
          :ok <- maybe_chmod(path, mode) do
       :ok
     end
   end
 
-  @impl Depot.Adapter
-  def write_stream(%Config{} = config, path, opts) do
-    modes = opts[:modes] || []
-    line_or_bytes = opts[:chunk_size] || :line
-    {:ok, File.stream!(full_path(config, path), modes, line_or_bytes)}
-  rescue
-    e -> {:error, e}
-  end
+  @impl true
+  def delete(%__MODULE__{} = state, address) do
+    path = local_path(state, address)
 
-  @impl Depot.Adapter
-  def read(%Config{} = config, path) do
-    File.read(full_path(config, path))
-  end
-
-  @impl Depot.Adapter
-  def read_stream(%Config{} = config, path, opts) do
-    modes = opts[:modes] || []
-    line_or_bytes = opts[:chunk_size] || :line
-    {:ok, File.stream!(full_path(config, path), modes, line_or_bytes)}
-  rescue
-    e -> {:error, e}
-  end
-
-  @impl Depot.Adapter
-  def delete(%Config{} = config, path) do
-    with {:error, :enoent} <- File.rm(full_path(config, path)), do: :ok
-  end
-
-  @impl Depot.Adapter
-  def move(%Config{} = config, source, destination, opts) do
-    source = full_path(config, source)
-    destination = full_path(config, destination)
-
-    with :ok <- ensure_directory(config, Path.dirname(destination), opts) do
-      File.rename(source, destination)
+    case File.rm(path) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      error -> error
     end
   end
 
-  @impl Depot.Adapter
-  def copy(%Config{} = config, source, destination, opts) do
-    source = full_path(config, source)
-    destination = full_path(config, destination)
+  @impl true
+  def move(%__MODULE__{} = state, source, destination, _opts) do
+    src_path = local_path(state, source)
+    dst_path = local_path(state, destination)
 
-    with :ok <- ensure_directory(config, Path.dirname(destination), opts) do
-      File.cp(source, destination)
+    with :ok <- ensure_parent_dir(state, destination) do
+      File.rename(src_path, dst_path)
     end
   end
 
-  @impl Depot.Adapter
+  @impl true
   def copy(
-        %Config{} = source_config,
+        %__MODULE__{} = state,
         source,
-        %Config{} = destination_config,
         destination,
         opts
       ) do
-    source = full_path(source_config, source)
-    destination = full_path(destination_config, destination)
+    source = local_path(state, source)
+    destination = local_path(state, destination)
 
-    with :ok <- ensure_directory(destination_config, Path.dirname(destination), opts) do
+    with :ok <- ensure_parent_dir(state, destination) do
       File.cp(source, destination)
     end
   end
 
-  @impl Depot.Adapter
-  def file_exists(%Config{} = config, path) do
-    case File.exists?(full_path(config, path)) do
-      true -> {:ok, :exists}
-      false -> {:ok, :missing}
+  @impl true
+  def exists?(%__MODULE__{} = state, address) do
+    path = local_path(state, address)
+    File.exists?(path) |> then(&{:ok, if(&1, do: :exists, else: :missing)})
+  end
+
+  @impl true
+  def set_visibility(%__MODULE__{} = state, address, visibility) do
+    path = local_path(state, address)
+
+    mode =
+      if File.dir?(path) do
+        state.converter.for_directory(state.visibility, visibility)
+      else
+        state.converter.for_file(state.visibility, visibility)
+      end
+
+    File.chmod(path, mode)
+  end
+
+  @impl true
+  def get_visibility(%__MODULE__{} = state, address) do
+    path = local_path(state, address)
+
+    with {:ok, %{mode: mode, type: type}} <- File.stat(path) do
+      {:ok, visibility_for_mode(state, type, mode)}
     end
   end
 
-  @impl Depot.Adapter
-  def list_contents(%Config{} = config, path) do
-    full_path = full_path(config, path)
+  @impl Depot.Adapter.Collection
+  def list(%__MODULE__{} = state, address) do
+    path = local_path(state, address)
 
-    with {:ok, files} <- File.ls(full_path) do
-      contents =
-        for file <- files,
-            {:ok, stat} = File.stat(Path.join(full_path, file), time: :posix),
-            stat.type in [:directory, :regular] do
-          struct =
-            case stat.type do
-              :directory -> Depot.Stat.Dir
-              :regular -> Depot.Stat.File
+    with {:ok, entries} <- File.ls(path) do
+      resources =
+        entries
+        |> Enum.map(fn entry ->
+          full_path = Path.join(path, entry)
+
+          # Create a proper Depot.Address for the entry
+          entry_address =
+            case address do
+              %Depot.Address{} = addr ->
+                # Join while preserving the scheme and other URI parts
+                Depot.Address.join(addr, entry)
+
+              binary when is_binary(binary) ->
+                # Create a new address with proper absolute path
+                Depot.Address.new("/" <> entry)
             end
 
-          struct!(struct,
-            name: file,
-            size: stat.size,
-            mtime: stat.mtime,
-            visibility: visibility_for_mode(config, stat.type, stat.mode)
-          )
-        end
+          case File.stat(full_path, time: :posix) do
+            {:ok, stat} -> create_resource(state, entry_address, stat)
+            {:error, _} -> nil
+          end
+        end)
+        |> Enum.reject(&is_nil/1)
 
-      {:ok, contents}
+      {:ok, resources}
     end
   end
 
-  @impl Depot.Adapter
-  def create_directory(%Config{} = config, path, opts) do
-    path = full_path(config, path)
-    ensure_directory(config, path, opts)
+  @impl Depot.Adapter.Collection
+  def create_collection(%__MODULE__{} = state, address, opts \\ []) do
+    path = local_path(state, address)
+    ensure_directory(state, path, opts)
   end
 
-  @impl Depot.Adapter
-  def delete_directory(%Config{} = config, path, opts) do
-    path = full_path(config, path)
+  @impl Depot.Adapter.Collection
+  def delete_collection(%__MODULE__{} = state, address, opts \\ []) do
+    path = local_path(state, address)
 
     if Keyword.get(opts, :recursive, false) do
       with {:ok, _} <- File.rm_rf(path), do: :ok
@@ -211,58 +168,90 @@ defmodule Depot.Adapter.Local do
     end
   end
 
-  @impl Depot.Adapter
-  def clear(%Config{} = config) do
-    with {:ok, contents} <- list_contents(%Config{} = config, ".") do
-      Enum.reduce_while(contents, :ok, fn dir_or_file, :ok ->
-        case clear_dir_or_file(config, dir_or_file) do
-          :ok -> {:cont, :ok}
-          err -> {:halt, err}
+  @impl Depot.Adapter.Stream
+  def read_stream(%__MODULE__{} = state, address, opts) when is_list(opts) do
+    path = local_path(state, address)
+    modes = Keyword.get(opts, :modes, [:read, :binary])
+    chunk_size = Keyword.get(opts, :chunk_size, :line)
+
+    case File.exists?(path) do
+      true ->
+        try do
+          {:ok, File.stream!(path, modes, chunk_size)}
+        rescue
+          e -> {:error, e}
         end
-      end)
+
+      false ->
+        {:error, %File.Error{action: :open_read, path: path}}
     end
   end
 
-  @impl Depot.Adapter
-  def set_visibility(%Config{} = config, path, visibility) do
-    path = full_path(config, path)
+  @impl Depot.Adapter.Stream
+  def write_stream(%__MODULE__{} = state, address, opts \\ []) do
+    path = local_path(state, address)
 
-    mode =
-      if File.dir?(path) do
-        config.converter.for_directory(config.visibility, visibility)
-      else
-        config.converter.for_file(config.visibility, visibility)
+    with :ok <- ensure_parent_dir(state, address) do
+      modes = Keyword.get(opts, :modes, [:write, :binary])
+      chunk_size = Keyword.get(opts, :chunk_size, :line)
+
+      try do
+        {:ok, File.stream!(path, modes, chunk_size)}
+      rescue
+        e -> {:error, e}
+      end
+    end
+  end
+
+  # Private helpers
+
+  defp local_path(%__MODULE__{} = state, address) do
+    address = if is_binary(address), do: Depot.Address.new(address), else: address
+    {:ok, normalized_address} = Depot.Address.normalize(address)
+    Path.join(state.root_path, normalized_address.path)
+  end
+
+  defp create_resource(state, address, %File.Stat{} = stat) do
+    type =
+      case stat.type do
+        :regular -> :file
+        :directory -> :directory
+        _ -> nil
       end
 
-    File.chmod(path, mode)
-  end
+    visibility =
+      case stat.mode &&& 0o777 do
+        0o600 -> :private
+        _ -> :public
+      end
 
-  @impl Depot.Adapter
-  def visibility(%Config{} = config, path) do
-    path = full_path(config, path)
-
-    with {:ok, %{mode: mode, type: type}} <- File.stat(path) do
-      {:ok, visibility_for_mode(config, type, mode)}
+    if type do
+      Depot.Resource.new(
+        address,
+        type,
+        size: stat.size,
+        mtime: DateTime.from_unix!(stat.mtime),
+        metadata: %{
+          executable: (stat.mode &&& 0o111) > 0,
+          watchable: true,
+          visibility: visibility_for_mode(state, type, stat.mode)
+        }
+      )
     end
   end
 
-  defp visibility_for_mode(config, type, mode) do
+  defp visibility_for_mode(state, type, mode) do
     mode = mode &&& 0o777
 
     case type do
-      :directory -> config.converter.from_directory(config.visibility, mode)
-      _ -> config.converter.from_file(config.visibility, mode)
+      :directory -> state.converter.from_directory(state.visibility, mode)
+      _ -> state.converter.from_file(state.visibility, mode)
     end
   end
 
-  defp clear_dir_or_file(config, %Depot.Stat.Dir{name: dir}),
-    do: delete_directory(config, dir, recursive: true)
-
-  defp clear_dir_or_file(config, %Depot.Stat.File{name: name}),
-    do: delete(config, name)
-
-  defp full_path(config, path) do
-    Depot.RelativePath.join_prefix(config.prefix, path)
+  defp ensure_parent_dir(%__MODULE__{} = state, address, opts \\ []) do
+    path = local_path(state, address) |> Path.dirname()
+    ensure_directory(state, path, opts)
   end
 
   defp ensure_directory(config, path, opts) do
@@ -288,7 +277,7 @@ defmodule Depot.Adapter.Local do
     end
   end
 
-  def existing_directory(path) do
+  defp existing_directory(path) do
     if File.dir?(path), do: :ok, else: :missing
   end
 

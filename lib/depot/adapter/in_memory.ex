@@ -1,13 +1,12 @@
 defmodule Depot.Adapter.InMemory do
   @moduledoc """
-  Depot Adapter using an `Agent` for in memory storage.
+  Depot Adapter using an `Agent` for in-memory storage.
 
   ## Direct usage
 
-      iex> filesystem = Depot.Adapter.InMemory.configure(name: InMemoryFileSystem)
-      iex> start_supervised(filesystem)
-      iex> :ok = Depot.write(filesystem, "test.txt", "Hello World")
-      iex> {:ok, "Hello World"} = Depot.read(filesystem, "test.txt")
+      iex> {:ok, filesystem} = Depot.Adapter.InMemory.start(name: InMemoryFileSystem)
+      iex> :ok = Depot.write(filesystem, "/test.txt", "Hello World")
+      iex> {:ok, "Hello World"} = Depot.read(filesystem, "/test.txt")
 
   ## Usage with a module
 
@@ -16,33 +15,40 @@ defmodule Depot.Adapter.InMemory do
           adapter: Depot.Adapter.InMemory
       end
 
-      start_supervised(InMemoryFileSystem)
+      {:ok, _} = InMemoryFileSystem.start_link([])
 
-      InMemoryFileSystem.write("test.txt", "Hello World")
-      {:ok, "Hello World"} = InMemoryFileSystem.read("test.txt")
+      InMemoryFileSystem.write("/test.txt", "Hello World")
+      {:ok, "Hello World"} = InMemoryFileSystem.read("/test.txt")
   """
 
+  use Depot.Adapter,
+    scheme: "memory",
+    capabilities: [:transformable, :collection, :streamable]
+
+  @behaviour Depot.Adapter.Stream
+  @behaviour Depot.Adapter.Collection
   defmodule AgentStream do
     @enforce_keys [:config, :path]
     defstruct config: nil, path: nil, chunk_size: 1024
 
     defimpl Enumerable do
-      def reduce(%{config: config, path: path, chunk_size: chunk_size}, a, b) do
+      def reduce(%{config: config, path: path, chunk_size: chunk_size}, acc, fun) do
         case Depot.Adapter.InMemory.read(config, path) do
           {:ok, contents} ->
-            contents
-            |> Depot.chunk(chunk_size)
-            |> reduce(a, b)
+            Stream.unfold({contents, 0}, fn
+              {data, offset} when byte_size(data) > offset ->
+                chunk = binary_part(data, offset, min(chunk_size, byte_size(data) - offset))
+                {chunk, {data, offset + byte_size(chunk)}}
+
+              _ ->
+                nil
+            end)
+            |> Enumerable.reduce(acc, fun)
 
           _ ->
-            {:halted, []}
+            {:halted, acc}
         end
       end
-
-      def reduce(_list, {:halt, acc}, _fun), do: {:halted, acc}
-      def reduce(list, {:suspend, acc}, fun), do: {:suspended, acc, &reduce(list, &1, fun)}
-      def reduce([], {:cont, acc}, _fun), do: {:done, acc}
-      def reduce([head | tail], {:cont, acc}, fun), do: reduce(tail, fun.(head, acc), fun)
 
       def count(_), do: {:error, __MODULE__}
       def slice(_), do: {:error, __MODULE__}
@@ -75,248 +81,305 @@ defmodule Depot.Adapter.InMemory do
     end
   end
 
-  use Agent
+  defstruct [:name, :pid, :converter, :visibility]
 
-  defmodule Config do
-    @moduledoc false
-    defstruct name: nil
-  end
+  @impl true
+  def start(opts) when is_list(opts) do
+    name = Keyword.fetch!(opts, :name)
+    visibility_config = Keyword.get(opts, :visibility, [])
 
-  @behaviour Depot.Adapter
+    converter =
+      Keyword.get(visibility_config, :converter, Depot.Visibility.PortableUnixVisibilityConverter)
 
-  @impl Depot.Adapter
-  def starts_processes, do: true
+    visibility = visibility_config |> Keyword.drop([:converter]) |> converter.config()
 
-  def start_link({__MODULE__, %Config{} = config}) do
-    start_link(config)
-  end
-
-  def start_link(%Config{} = config) do
-    Agent.start_link(fn -> {%{}, %{}} end, name: Depot.Registry.via(__MODULE__, config.name))
-  end
-
-  @impl Depot.Adapter
-  def configure(opts) do
-    config = %Config{
-      name: Keyword.fetch!(opts, :name)
+    state = %__MODULE__{
+      name: name,
+      converter: converter,
+      visibility: visibility
     }
 
-    {__MODULE__, config}
+    case Agent.start_link(fn -> {%{}, %{}} end, name: via_name(name)) do
+      {:ok, pid} -> {:ok, %{state | pid: pid}}
+      error -> error
+    end
   end
 
-  @impl Depot.Adapter
-  def write(config, path, contents, opts) do
-    visibility = Keyword.get(opts, :visibility, :private)
-    directory_visibility = Keyword.get(opts, :directory_visibility, :private)
-
-    Agent.update(Depot.Registry.via(__MODULE__, config.name), fn state ->
-      file = {IO.iodata_to_binary(contents), %{visibility: visibility}}
-      directory = {%{}, %{visibility: directory_visibility}}
-      put_in(state, accessor(path, directory), file)
-    end)
-  end
-
-  @impl Depot.Adapter
-  def write_stream(config, path, opts) do
-    {:ok,
-     %AgentStream{
-       config: config,
-       path: path,
-       chunk_size: Keyword.get(opts, :chunk_size, 1024)
-     }}
-  end
-
-  @impl Depot.Adapter
-  def read(config, path) do
-    Agent.get(Depot.Registry.via(__MODULE__, config.name), fn state ->
-      case get_in(state, accessor(path)) do
-        {binary, _meta} when is_binary(binary) -> {:ok, binary}
-        _ -> {:error, :enoent}
+  @impl true
+  def read(%__MODULE__{} = state, address) do
+    Agent.get(via_name(state.name), fn {files, _} ->
+      case Map.fetch(files, local_path(address)) do
+        {:ok, {content, _meta}} -> {:ok, content}
+        :error -> {:error, :enoent}
       end
     end)
   end
 
-  @impl Depot.Adapter
-  def read_stream(config, path, opts) do
-    {:ok,
-     %AgentStream{
-       config: config,
-       path: path,
-       chunk_size: Keyword.get(opts, :chunk_size, 1024)
-     }}
-  end
+  @impl true
+  def write(%__MODULE__{} = state, address, contents, opts \\ [])
+      when is_binary(contents) do
+    file_visibility = Keyword.get(opts, :visibility, :private)
+    dir_visibility = Keyword.get(opts, :directory_visibility, :private)
+    file_mode = state.converter.for_file(state.visibility, file_visibility)
+    dir_mode = state.converter.for_directory(state.visibility, dir_visibility)
 
-  @impl Depot.Adapter
-  def delete(%Config{} = config, path) do
-    Agent.update(Depot.Registry.via(__MODULE__, config.name), fn state ->
-      {_, state} = pop_in(state, accessor(path))
-      state
+    Agent.update(via_name(state.name), fn {files, dirs} ->
+      path = local_path(address)
+      file = {contents, %{visibility: file_visibility, mode: file_mode}}
+      files = Map.put(files, path, file)
+      dirs = ensure_parent_dir(state, dirs, path, opts)
+      {files, dirs}
     end)
-
-    :ok
   end
 
-  @impl Depot.Adapter
-  def move(%Config{} = config, source, destination, opts) do
-    visibility = Keyword.get(opts, :visibility, :private)
-    directory_visibility = Keyword.get(opts, :directory_visibility, :private)
+  @impl true
+  def delete(%__MODULE__{} = state, address) do
+    Agent.update(via_name(state.name), fn {files, dirs} ->
+      path = local_path(address)
+      files = Map.delete(files, path)
+      {files, dirs}
+    end)
+  end
 
-    Agent.get_and_update(Depot.Registry.via(__MODULE__, config.name), fn state ->
-      case get_in(state, accessor(source)) do
-        {binary, _meta} when is_binary(binary) ->
-          file = {binary, %{visibility: visibility}}
-          directory = {%{}, %{visibility: directory_visibility}}
+  @impl true
+  def move(%__MODULE__{} = state, source, destination, opts) do
+    Agent.get_and_update(via_name(state.name), fn {files, dirs} ->
+      src_path = local_path(source)
+      dst_path = local_path(destination)
 
-          {_, state} =
-            state |> put_in(accessor(destination, directory), file) |> pop_in(accessor(source))
+      case Map.pop(files, src_path) do
+        {nil, _} ->
+          {{:error, :enoent}, {files, dirs}}
 
-          {:ok, state}
-
-        _ ->
-          {{:error, :enoent}, state}
+        {file, files} ->
+          dirs = ensure_parent_dir(state, dirs, dst_path, opts)
+          files = Map.put(files, dst_path, file)
+          {:ok, {files, dirs}}
       end
     end)
   end
 
-  @impl Depot.Adapter
-  def copy(%Config{} = config, source, destination, opts) do
-    visibility = Keyword.get(opts, :visibility, :private)
-    directory_visibility = Keyword.get(opts, :directory_visibility, :private)
+  @impl true
+  def copy(%__MODULE__{} = state, source, destination, opts) do
+    Agent.get_and_update(via_name(state.name), fn {files, dirs} ->
+      src_path = local_path(source)
+      dst_path = local_path(destination)
 
-    Agent.get_and_update(Depot.Registry.via(__MODULE__, config.name), fn state ->
-      case get_in(state, accessor(source)) do
-        {binary, _meta} when is_binary(binary) ->
-          file = {binary, %{visibility: visibility}}
-          directory = {%{}, %{visibility: directory_visibility}}
-          {:ok, put_in(state, accessor(destination, directory), file)}
+      case Map.fetch(files, src_path) do
+        {:ok, file} ->
+          dirs = ensure_parent_dir(state, dirs, dst_path, opts)
+          files = Map.put(files, dst_path, file)
+          {:ok, {files, dirs}}
 
-        _ ->
-          {{:error, :enoent}, state}
+        :error ->
+          {{:error, :enoent}, {files, dirs}}
       end
     end)
   end
 
-  @impl Depot.Adapter
-  def copy(
-        %Config{} = _source_config,
-        _source,
-        %Config{} = _destination_config,
-        _destination,
-        _opts
-      ) do
-    {:error, :unsupported}
-  end
+  @impl true
+  def exists?(%__MODULE__{} = state, address) do
+    Agent.get(via_name(state.name), fn {files, dirs} ->
+      path = local_path(address)
 
-  @impl Depot.Adapter
-  def file_exists(%Config{} = config, path) do
-    Agent.get(Depot.Registry.via(__MODULE__, config.name), fn state ->
-      case get_in(state, accessor(path)) do
-        {binary, _meta} when is_binary(binary) -> {:ok, :exists}
-        _ -> {:ok, :missing}
+      cond do
+        Map.has_key?(files, path) -> {:ok, :exists}
+        Map.has_key?(dirs, path) -> {:ok, :exists}
+        true -> {:ok, :missing}
       end
     end)
   end
 
-  @impl Depot.Adapter
-  def list_contents(%Config{} = config, path) do
-    contents =
-      Agent.get(Depot.Registry.via(__MODULE__, config.name), fn state ->
-        paths =
-          case get_in(state, accessor(path)) do
-            {%{} = map, _meta} -> map
-            _ -> %{}
+  @impl true
+  def set_visibility(%__MODULE__{} = state, address, visibility) do
+    Agent.get_and_update(via_name(state.name), fn {files, dirs} ->
+      path = local_path(address)
+
+      case Map.fetch(files, path) do
+        {:ok, {content, meta}} ->
+          mode = state.converter.for_file(state.visibility, visibility)
+          files = Map.put(files, path, {content, %{meta | visibility: visibility, mode: mode}})
+          {:ok, {files, dirs}}
+
+        :error ->
+          case Map.fetch(dirs, path) do
+            {:ok, meta} ->
+              mode = state.converter.for_directory(state.visibility, visibility)
+              dirs = Map.put(dirs, path, %{meta | visibility: visibility, mode: mode})
+              {:ok, {files, dirs}}
+
+            :error ->
+              {{:error, :enoent}, {files, dirs}}
           end
+      end
+    end)
+  end
 
-        for {path, {content, meta}} <- paths do
-          struct =
-            case content do
-              %{} -> %Depot.Stat.Dir{size: 0}
-              bin when is_binary(bin) -> %Depot.Stat.File{size: byte_size(bin)}
+  @impl true
+  def get_visibility(%__MODULE__{} = state, address) do
+    Agent.get(via_name(state.name), fn {files, dirs} ->
+      path = local_path(address)
+
+      case Map.fetch(files, path) do
+        {:ok, {_, %{visibility: visibility}}} ->
+          {:ok, visibility}
+
+        :error ->
+          case Map.fetch(dirs, path) do
+            {:ok, %{visibility: visibility}} -> {:ok, visibility}
+            :error -> {:error, :enoent}
+          end
+      end
+    end)
+  end
+
+  @impl Depot.Adapter.Collection
+  def list(%__MODULE__{} = state, address) do
+    Agent.get(via_name(state.name), fn {files, dirs} ->
+      prefix = local_path(address)
+      # Normalize prefix to just "/" if listing root
+      prefix = if prefix in ["/", "/."], do: "/", else: prefix
+
+      resources =
+        (Map.keys(files) ++ Map.keys(dirs))
+        |> Enum.filter(&String.starts_with?(&1, prefix))
+        # Filter out the root directory itself
+        |> Enum.reject(&(&1 == "/" || &1 == "/."))
+        |> Enum.map(fn path ->
+          # Clean up relative path handling
+          entry_path =
+            if prefix == "/" do
+              # For root listings, just use the path directly
+              path
+            else
+              # For subdirectories, handle relative paths
+              "/" <> Path.relative_to(path, prefix)
             end
 
-          struct!(struct, name: path, mtime: 0, visibility: meta.visibility)
+          # Create clean address with absolute path
+          entry_address = %Depot.Address{
+            scheme: "memory",
+            path: entry_path
+          }
+
+          cond do
+            Map.has_key?(files, path) ->
+              {content, meta} = Map.get(files, path)
+
+              Depot.Resource.new(
+                entry_address,
+                :file,
+                size: byte_size(content),
+                mtime: DateTime.utc_now(),
+                metadata: meta
+              )
+
+            Map.has_key?(dirs, path) ->
+              meta = Map.get(dirs, path)
+
+              Depot.Resource.new(
+                entry_address,
+                :directory,
+                size: 0,
+                mtime: DateTime.utc_now(),
+                metadata: meta
+              )
+          end
+        end)
+        |> Enum.reject(&is_nil/1)
+
+      {:ok, resources}
+    end)
+  end
+
+  @impl Depot.Adapter.Collection
+  def create_collection(%__MODULE__{} = state, address, opts \\ []) do
+    Agent.update(via_name(state.name), fn {files, dirs} ->
+      path = local_path(address)
+
+      dirs =
+        Map.put(dirs, path, %{
+          visibility: Keyword.get(opts, :directory_visibility, :public),
+          mode: 0o755
+        })
+
+      dirs = ensure_parent_dir(state, dirs, path, opts)
+
+      {files, dirs}
+    end)
+  end
+
+  @impl Depot.Adapter.Collection
+  def delete_collection(%__MODULE__{} = state, address, opts \\ []) do
+    recursive = Keyword.get(opts, :recursive, false)
+
+    Agent.get_and_update(via_name(state.name), fn {files, dirs} ->
+      path = local_path(address)
+
+      if recursive do
+        files = Map.drop(files, Enum.filter(Map.keys(files), &String.starts_with?(&1, path)))
+        dirs = Map.drop(dirs, Enum.filter(Map.keys(dirs), &String.starts_with?(&1, path)))
+        {:ok, {files, dirs}}
+      else
+        case Map.pop(dirs, path) do
+          {nil, _} ->
+            {{:error, :enoent}, {files, dirs}}
+
+          {_, dirs} ->
+            if Enum.any?(Map.keys(files) ++ Map.keys(dirs), &String.starts_with?(&1, path <> "/")) do
+              {{:error, :eexist}, {files, dirs}}
+            else
+              {:ok, {files, dirs}}
+            end
         end
-      end)
-
-    {:ok, contents}
-  end
-
-  @impl Depot.Adapter
-  def create_directory(%Config{} = config, path, opts) do
-    directory_visibility = Keyword.get(opts, :directory_visibility, :private)
-    directory = {%{}, %{visibility: directory_visibility}}
-
-    Agent.update(Depot.Registry.via(__MODULE__, config.name), fn state ->
-      put_in(state, accessor(path, directory), directory)
-    end)
-  end
-
-  @impl Depot.Adapter
-  def delete_directory(%Config{} = config, path, opts) do
-    recursive? = Keyword.get(opts, :recursive, false)
-
-    Agent.get_and_update(Depot.Registry.via(__MODULE__, config.name), fn state ->
-      case {recursive?, get_in(state, accessor(path))} do
-        {_, nil} ->
-          {:ok, state}
-
-        {recursive?, {map, _meta}} when is_map(map) and (map_size(map) == 0 or recursive?) ->
-          {_, state} = pop_in(state, accessor(path))
-          {:ok, state}
-
-        _ ->
-          {{:error, :eexist}, state}
       end
     end)
   end
 
-  @impl Depot.Adapter
-  def clear(%Config{} = config) do
-    Agent.update(Depot.Registry.via(__MODULE__, config.name), fn _ -> {%{}, %{}} end)
+  @impl Depot.Adapter.Stream
+  def read_stream(%__MODULE__{} = state, address, opts) do
+    chunk_size = Keyword.get(opts, :chunk_size, 1024)
+
+    {:ok,
+     %AgentStream{
+       config: state,
+       path: address,
+       chunk_size: chunk_size
+     }}
   end
 
-  @impl Depot.Adapter
-  def set_visibility(%Config{} = config, path, visibility) do
-    Agent.get_and_update(Depot.Registry.via(__MODULE__, config.name), fn state ->
-      case get_in(state, accessor(path)) do
-        {_, _} ->
-          state =
-            update_in(state, accessor(path), fn {contents, meta} ->
-              {contents, Map.put(meta, :visibility, visibility)}
-            end)
+  @impl Depot.Adapter.Stream
+  def write_stream(%__MODULE__{} = state, address, opts \\ []) do
+    chunk_size = Keyword.get(opts, :chunk_size, 1024)
 
-          {:ok, state}
-
-        _ ->
-          {{:error, :enoent}, state}
-      end
-    end)
+    {:ok,
+     %AgentStream{
+       config: state,
+       path: address,
+       chunk_size: chunk_size
+     }}
   end
 
-  @impl Depot.Adapter
-  def visibility(%Config{} = config, path) do
-    Agent.get(Depot.Registry.via(__MODULE__, config.name), fn state ->
-      case get_in(state, accessor(path)) do
-        {_, %{visibility: visibility}} -> {:ok, visibility}
-        _ -> {:error, :enoent}
-      end
-    end)
+  defp local_path(address) do
+    address = if is_binary(address), do: Depot.Address.new(address), else: address
+    {:ok, normalized_address} = Depot.Address.normalize(address)
+    normalized_address.path
   end
 
-  defp accessor(path, default \\ nil) when is_binary(path) do
-    path
-    |> Path.absname("/")
-    |> Path.split()
-    |> do_accessor([], default)
-    |> Enum.reverse()
+  defp ensure_parent_dir(state, dirs, path, opts) do
+    parent_path = Path.dirname(path)
+
+    visibility = Keyword.get(opts, :directory_visibility, :private)
+    mode = state.converter.for_directory(state.visibility, visibility)
+
+    ensure_directory(state, dirs, parent_path, visibility, mode)
   end
 
-  defp do_accessor([segment], acc, default) do
-    [Access.key(segment, default), Access.elem(0) | acc]
-  end
-
-  defp do_accessor([segment | rest], acc, default) do
-    intermediate_default = default || {%{}, %{}}
-    do_accessor(rest, [Access.key(segment, intermediate_default), Access.elem(0) | acc], default)
+  defp ensure_directory(state, dirs, path, visibility, mode) do
+    if Map.has_key?(dirs, path) do
+      dirs
+    else
+      Map.put(dirs, path, %{visibility: visibility, mode: mode})
+    end
   end
 end

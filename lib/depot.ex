@@ -8,6 +8,107 @@ defmodule Depot do
   @type adapter :: module()
   @type filesystem :: {module(), Depot.Adapter.config()}
 
+  @type capability :: Depot.Capability.t()
+
+  defmacro __using__(opts) do
+    quote bind_quoted: [opts: opts] do
+      {adapter, opts} = Depot.parse_opts(__MODULE__, opts)
+
+      @adapter adapter
+      @opts opts
+
+      def __filesystem__, do: struct(@adapter, @opts)
+
+      def read(path), do: Depot.read(__filesystem__(), path)
+
+      def write(path, contents, opts \\ []),
+        do: Depot.write(__filesystem__(), path, contents, opts)
+
+      def delete(path), do: Depot.delete(__filesystem__(), path)
+
+      def move(source, destination, opts \\ []),
+        do: Depot.move(__filesystem__(), source, destination, opts)
+
+      def copy(source, destination, opts \\ []),
+        do: Depot.copy(__filesystem__(), source, destination, opts)
+
+      def exists?(path, opts \\ []), do: Depot.exists?(__filesystem__(), path, opts)
+
+      def set_visibility(path, visibility, opts \\ []),
+        do: Depot.set_visibility(__filesystem__(), path, visibility, opts)
+
+      def get_visibility(path, opts \\ []), do: Depot.get_visibility(__filesystem__(), path, opts)
+
+      # Optional Collection behavior
+      def list(path, opts \\ []), do: Depot.list(__filesystem__(), path, opts)
+
+      def create_collection(path, opts \\ []),
+        do: Depot.create_collection(__filesystem__(), path)
+
+      def delete_collection(path, opts \\ []),
+        do: Depot.delete_collection(__filesystem__(), path, opts)
+
+      # Optional Stream behavior
+      def read_stream(path, opts \\ []), do: Depot.read_stream(__filesystem__(), path, opts)
+      def write_stream(path, opts \\ []), do: Depot.write_stream(__filesystem__(), path, opts)
+
+      # Optional Executable behavior
+      def execute(path, args \\ []), do: Depot.execute(__filesystem__(), path, args)
+
+      # Optional Mountable behavior
+      def mount(source_config, destination_address, opts \\ []),
+        do: Depot.mount(__filesystem__(), source_config, destination_address, opts)
+
+      def unmount(address, opts \\ []), do: Depot.unmount(__filesystem__(), address, opts)
+
+      def supports?(capability), do: Depot.supports?(__filesystem__(), capability)
+    end
+  end
+
+  def parse_opts(module, opts) do
+    opts
+    |> merge_app_env(module)
+    |> Keyword.put_new(:name, module)
+    |> Keyword.pop!(:adapter)
+  end
+
+  def merge_app_env(opts, module) do
+    case Keyword.fetch(opts, :otp_app) do
+      {:ok, otp_app} ->
+        config = Application.get_env(otp_app, module, [])
+        Keyword.merge(opts, config)
+
+      :error ->
+        opts
+    end
+  end
+
+  @doc """
+  Start the adapter with the given options.
+
+  ## Examples
+
+      {:ok, filesystem} = Depot.start(MyAdapter, name: MyFs, root_path: "/tmp")
+
+  """
+  @spec start(module(), keyword()) :: :ok | {:ok, pid()} | {:error, term()}
+  def start(adapter, opts) do
+    adapter.start(opts)
+  end
+
+  @doc """
+  Get the capabilities of the adapter.
+
+  ## Examples
+
+      capabilities = Depot.capabilities(MyAdapter)
+
+  """
+  @spec capabilities(module()) :: Depot.Capability.Adapter.t()
+  def capabilities(adapter) do
+    adapter.capabilities()
+  end
+
   @doc """
   Write to a filesystem
 
@@ -21,58 +122,23 @@ defmodule Depot do
   ### Module-based filesystem
 
       defmodule LocalFileSystem do
-        use Depot.Filesystem,
+        use Depot,
           adapter: Depot.Adapter.Local,
-          prefix: "/home/user/storage"
+          root_path: "/home/user/storage"
       end
 
       LocalFileSystem.write("test.txt", "Hello World")
 
   """
-  @spec write(filesystem, Path.t(), iodata(), keyword()) :: :ok | {:error, term}
-  def write({adapter, config}, path, contents, opts \\ []) do
-    with {:ok, path} <- Depot.RelativePath.normalize(path) do
-      adapter.write(config, path, contents, opts)
-    end
-  end
-
-  @doc """
-  Returns a `Stream` for writing to the given `path`.
-
-  ## Options
-
-  The following stream options apply to all adapters:
-
-    * `:chunk_size` - When reading, the amount to read,
-      usually expressed as a number of bytes.
-
-  ## Examples
-
-  > Note: The shape of the returned stream will
-  > necessarily depend on the adapter in use. In the
-  > following examples the [`Local`](`Depot.Adapter.Local`)
-  > adapter is invoked, which returns a `File.Stream`.
-
-  ### Direct filesystem
-
-      filesystem = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
-      {:ok, %File.Stream{}} = Depot.write_stream(filesystem, "test.txt")
-
-  ### Module-based filesystem
-
-      defmodule LocalFileSystem do
-        use Depot.Filesystem,
-          adapter: Depot.Adapter.Local,
-          prefix: "/home/user/storage"
-      end
-
-      {:ok, %File.Stream{}} = LocalFileSystem.write_stream("test.txt")
-
-  """
-  def write_stream({adapter, config}, path, opts \\ []) do
-    with {:ok, path} <- Depot.RelativePath.normalize(path) do
-      adapter.write_stream(config, path, opts)
-    end
+  @spec write(filesystem, Depot.Address.t() | binary(), iodata(), keyword()) ::
+          :ok | {:error, term()}
+  def write(filesystem, address, contents, opts \\ []) do
+    filesystem
+    |> get_adapter()
+    |> has_capability?(:transformable)
+    |> then(fn adapter ->
+      adapter.write(filesystem, address, contents, opts)
+    end)
   end
 
   @doc """
@@ -83,63 +149,28 @@ defmodule Depot do
   ### Direct filesystem
 
       filesystem = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
-      {:ok, "Hello World"} = Depot.read(filesystem, "test.txt")
+      {:ok, content} = Depot.read(filesystem, "test.txt")
 
   ### Module-based filesystem
 
       defmodule LocalFileSystem do
-        use Depot.Filesystem,
+        use Depot,
           adapter: Depot.Adapter.Local,
-          prefix: "/home/user/storage"
+          root_path: "/home/user/storage"
       end
 
-      {:ok, "Hello World"} = LocalFileSystem.read("test.txt")
+      {:ok, content} = LocalFileSystem.read("test.txt")
 
   """
-  @spec read(filesystem, Path.t(), keyword()) :: {:ok, binary} | {:error, term}
-  def read({adapter, config}, path, _opts \\ []) do
-    with {:ok, path} <- Depot.RelativePath.normalize(path) do
-      adapter.read(config, path)
-    end
-  end
-
-  @doc """
-  Returns a `Stream` for reading the given `path`.
-
-  ## Options
-
-  The following stream options apply to all adapters:
-
-    * `:chunk_size` - When reading, the amount to read,
-      usually expressed as a number of bytes.
-
-  ## Examples
-
-  > Note: The shape of the returned stream will
-  > necessarily depend on the adapter in use. In the
-  > following examples the [`Local`](`Depot.Adapter.Local`)
-  > adapter is invoked, which returns a `File.Stream`.
-
-  ### Direct filesystem
-
-      filesystem = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
-      {:ok, %File.Stream{}} = Depot.read_stream(filesystem, "test.txt")
-
-  ### Module-based filesystem
-
-      defmodule LocalFileSystem do
-        use Depot.Filesystem,
-          adapter: Depot.Adapter.Local,
-          prefix: "/home/user/storage"
-      end
-
-      {:ok, %File.Stream{}} = LocalFileSystem.read_stream("test.txt")
-
-  """
-  def read_stream({adapter, config}, path, opts \\ []) do
-    with {:ok, path} <- Depot.RelativePath.normalize(path) do
-      adapter.read_stream(config, path, opts)
-    end
+  @spec read(filesystem, Depot.Address.t() | binary()) ::
+          {:ok, binary()} | {:error, term()}
+  def read(filesystem, address) do
+    filesystem
+    |> get_adapter()
+    |> has_capability?(:transformable)
+    |> then(fn adapter ->
+      adapter.read(filesystem, address)
+    end)
   end
 
   @doc """
@@ -155,350 +186,463 @@ defmodule Depot do
   ### Module-based filesystem
 
       defmodule LocalFileSystem do
-        use Depot.Filesystem,
+        use Depot,
           adapter: Depot.Adapter.Local,
-          prefix: "/home/user/storage"
+          root_path: "/home/user/storage"
       end
 
       :ok = LocalFileSystem.delete("test.txt")
 
   """
-  @spec delete(filesystem, Path.t(), keyword()) :: :ok | {:error, term}
-  def delete({adapter, config}, path, _opts \\ []) do
-    with {:ok, path} <- Depot.RelativePath.normalize(path) do
-      adapter.delete(config, path)
-    end
+  @spec delete(filesystem, Depot.Address.t() | binary()) :: :ok | {:error, term()}
+  def delete(filesystem, address) do
+    filesystem
+    |> get_adapter()
+    |> has_capability?(:transformable)
+    |> then(fn adapter ->
+      adapter.delete(filesystem, address)
+    end)
   end
 
   @doc """
-  Move a file from source to destination on a filesystem
+  Move a file within a filesystem
 
   ## Examples
 
   ### Direct filesystem
 
       filesystem = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
-      :ok = Depot.move(filesystem, "test.txt", "other-test.txt")
+      :ok = Depot.move(filesystem, "source.txt", "destination.txt")
 
   ### Module-based filesystem
 
       defmodule LocalFileSystem do
-        use Depot.Filesystem,
+        use Depot,
           adapter: Depot.Adapter.Local,
-          prefix: "/home/user/storage"
+          root_path: "/home/user/storage"
       end
 
-      :ok = LocalFileSystem.move("test.txt", "other-test.txt")
+      :ok = LocalFileSystem.move("source.txt", "destination.txt")
 
   """
-  @spec move(filesystem, Path.t(), Path.t(), keyword()) :: :ok | {:error, term}
-  def move({adapter, config}, source, destination, opts \\ []) do
-    with {:ok, source} <- Depot.RelativePath.normalize(source),
-         {:ok, destination} <- Depot.RelativePath.normalize(destination) do
-      adapter.move(config, source, destination, opts)
-    end
+  @spec move(filesystem, Depot.Address.t() | binary(), Depot.Address.t() | binary(), keyword()) ::
+          :ok | {:error, term()}
+  def move(filesystem, source, destination, opts \\ []) do
+    filesystem
+    |> get_adapter()
+    |> has_capability?(:transformable)
+    |> then(fn adapter ->
+      adapter.move(filesystem, source, destination, opts)
+    end)
   end
 
   @doc """
-  Copy a file from source to destination on a filesystem
+  Copy a file within a filesystem or between filesystems
 
   ## Examples
 
-  ### Direct filesystem
+  ### Within the same filesystem
 
       filesystem = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
-      :ok = Depot.copy(filesystem, "test.txt", "other-test.txt")
+      :ok = Depot.copy(filesystem, "source.txt", "destination.txt")
 
-  ### Module-based filesystem
+  ### Between different filesystems
 
-      defmodule LocalFileSystem do
-        use Depot.Filesystem,
-          adapter: Depot.Adapter.Local,
-          prefix: "/home/user/storage"
-      end
-
-      :ok = LocalFileSystem.copy("test.txt", "other-test.txt")
+      source_fs = Depot.Adapter.Local.configure(prefix: "/home/user/source")
+      dest_fs = Depot.Adapter.S3.configure(bucket: "my-bucket")
+      :ok = Depot.copy(source_fs, "source.txt", dest_fs, "destination.txt")
 
   """
-  @spec copy(filesystem, Path.t(), Path.t(), keyword()) :: :ok | {:error, term}
-  def copy({adapter, config}, source, destination, opts \\ []) do
-    with {:ok, source} <- Depot.RelativePath.normalize(source),
-         {:ok, destination} <- Depot.RelativePath.normalize(destination) do
-      adapter.copy(config, source, destination, opts)
-    end
-  end
 
-  @doc """
-  Copy a file from source to destination on a filesystem
-
-  ## Examples
-
-  ### Direct filesystem
-
-      filesystem = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
-      :ok = Depot.copy(filesystem, "test.txt", "other-test.txt")
-
-  ### Module-based filesystem
-
-      defmodule LocalFileSystem do
-        use Depot.Filesystem,
-          adapter: Depot.Adapter.Local,
-          prefix: "/home/user/storage"
-      end
-
-      :ok = LocalFileSystem.copy("test.txt", "other-test.txt")
-
-  """
-  @spec file_exists(filesystem, Path.t(), keyword()) :: {:ok, :exists | :missing} | {:error, term}
-  def file_exists({adapter, config}, path, _opts \\ []) do
-    with {:ok, path} <- Depot.RelativePath.normalize(path) do
-      adapter.file_exists(config, path)
-    end
-  end
-
-  @doc """
-  List the contents of a folder on a filesystem
-
-  ## Examples
-
-  ### Direct filesystem
-
-      filesystem = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
-      {:ok, contents} = Depot.list_contents(filesystem, ".")
-
-  ### Module-based filesystem
-
-      defmodule LocalFileSystem do
-        use Depot.Filesystem,
-          adapter: Depot.Adapter.Local,
-          prefix: "/home/user/storage"
-      end
-
-      {:ok, contents} = LocalFileSystem.list_contents(".")
-
-  """
-  @spec list_contents(filesystem, Path.t(), keyword()) ::
-          {:ok, [%Depot.Stat.Dir{} | %Depot.Stat.File{}]} | {:error, term}
-  def list_contents({adapter, config}, path, _opts \\ []) do
-    with {:ok, path} <- Depot.RelativePath.normalize(path) do
-      adapter.list_contents(config, path)
-    end
-  end
-
-  @doc """
-  Create a directory
-
-  ## Examples
-
-  ### Direct filesystem
-
-      filesystem = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
-      :ok = Depot.create_directory(filesystem, "test/")
-
-  ### Module-based filesystem
-
-      defmodule LocalFileSystem do
-        use Depot.Filesystem,
-          adapter: Depot.Adapter.Local,
-          prefix: "/home/user/storage"
-      end
-
-      LocalFileSystem.create_directory("test/")
-
-  """
-  @spec create_directory(filesystem, Path.t(), keyword()) :: :ok | {:error, term}
-  def create_directory({adapter, config}, path, opts \\ []) do
-    with {:ok, path} <- Depot.RelativePath.normalize(path),
-         {:ok, path} <- Depot.RelativePath.assert_directory(path) do
-      adapter.create_directory(config, path, opts)
-    end
-  end
-
-  @doc """
-  Delete a directory.
-
-  ## Options
-
-    * `:recursive` - Recursively delete contents. Defaults to `false`.
-
-  ## Examples
-
-  ### Direct filesystem
-
-      filesystem = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
-      :ok = Depot.delete_directory(filesystem, "test/")
-
-  ### Module-based filesystem
-
-      defmodule LocalFileSystem do
-        use Depot.Filesystem,
-          adapter: Depot.Adapter.Local,
-          prefix: "/home/user/storage"
-      end
-
-      LocalFileSystem.delete_directory("test/")
-
-  """
-  @spec delete_directory(filesystem, Path.t(), keyword()) :: :ok | {:error, term}
-  def delete_directory({adapter, config}, path, opts \\ []) do
-    with {:ok, path} <- Depot.RelativePath.normalize(path),
-         {:ok, path} <- Depot.RelativePath.assert_directory(path) do
-      adapter.delete_directory(config, path, opts)
-    end
-  end
-
-  @doc """
-  Clear the filesystem.
-
-  This is always recursive.
-
-  ## Examples
-
-  ### Direct filesystem
-
-      filesystem = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
-      :ok = Depot.clear(filesystem)
-
-  ### Module-based filesystem
-
-      defmodule LocalFileSystem do
-        use Depot.Filesystem,
-          adapter: Depot.Adapter.Local,
-          prefix: "/home/user/storage"
-      end
-
-      LocalFileSystem.clear()
-
-  """
-  @spec clear(filesystem, keyword()) :: :ok | {:error, term}
-  def clear({adapter, config}, _opts \\ []) do
-    adapter.clear(config)
-  end
-
-  @spec set_visibility(filesystem, Path.t(), Depot.Visibility.t()) :: :ok | {:error, term}
-  def set_visibility({adapter, config}, path, visibility) do
-    with {:ok, path} <- Depot.RelativePath.normalize(path) do
-      adapter.set_visibility(config, path, visibility)
-    end
-  end
-
-  @spec visibility(filesystem, Path.t()) :: {:ok, Depot.Visibility.t()} | {:error, term}
-  def visibility({adapter, config}, path) do
-    with {:ok, path} <- Depot.RelativePath.normalize(path) do
-      adapter.visibility(config, path)
-    end
-  end
-
-  @doc """
-  Copy a file from one filesystem to the other
-
-  This can either be done natively if the same adapter is used for both filesystems
-  or by streaming/read-write cycle the file from the source to the local system
-  and back to the destination.
-
-  ## Examples
-
-  ### Direct filesystem
-
-      filesystem_source = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
-      filesystem_destination = Depot.Adapter.Local.configure(prefix: "/home/user/storage2")
-      :ok = Depot.copy_between_filesystem({filesystem_source, "test.txt"}, {filesystem_destination, "copy.txt"})
-
-  ### Module-based filesystem
-
-      defmodule LocalSourceFileSystem do
-        use Depot.Filesystem,
-          adapter: Depot.Adapter.Local,
-          prefix: "/home/user/storage"
-      end
-
-      defmodule LocalDestinationFileSystem do
-        use Depot.Filesystem,
-          adapter: Depot.Adapter.Local,
-          prefix: "/home/user/storage2"
-      end
-
-      :ok = Depot.copy_between_filesystem(
-        {LocalSourceFileSystem.__filesystem__(), "test.txt"},
-        {LocalDestinationFileSystem.__filesystem__(), "copy.txt"}
-      )
-
-  """
-  @spec copy_between_filesystem(
-          source :: {filesystem, Path.t()},
-          destination :: {filesystem, Path.t()},
+  @spec copy(
+          filesystem,
+          Depot.Address.t() | binary(),
+          Depot.Address.t() | binary(),
           keyword()
-        ) :: :ok | {:error, term}
-  def copy_between_filesystem(source, destination, opts \\ [])
-
-  # Same adapter, same config -> just do a plain copy
-  def copy_between_filesystem({filesystem, source}, {filesystem, destination}, opts) do
-    copy(filesystem, source, destination, opts)
+        ) ::
+          :ok | {:error, term()}
+  def copy(filesystem, source, destination, opts \\ []) do
+    filesystem
+    |> get_adapter()
+    |> has_capability?(:transformable)
+    |> then(fn adapter ->
+      adapter.copy(filesystem, source, destination, opts)
+    end)
   end
 
-  # Same adapter -> try direct copy if supported
-  def copy_between_filesystem(
-        {{adapter, config_source}, path_source} = source,
-        {{adapter, config_destination}, path_destination} = destination,
-        opts
-      ) do
-    with :ok <-
-           adapter.copy(config_source, path_source, config_destination, path_destination, opts) do
-      :ok
+  @doc """
+  Check if a file exists in a filesystem
+
+  ## Examples
+
+  ### Direct filesystem
+
+      filesystem = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
+      {:ok, :exists} = Depot.exists?(filesystem, "test.txt")
+
+  ### Module-based filesystem
+
+      defmodule LocalFileSystem do
+        use Depot,
+          adapter: Depot.Adapter.Local,
+          root_path: "/home/user/storage"
+      end
+
+      {:ok, :exists} = LocalFileSystem.exists?("test.txt")
+
+  """
+  @spec exists?(filesystem, Depot.Address.t() | binary()) ::
+          {:ok, :exists | :missing} | {:error, term()}
+  def exists?(filesystem, address) do
+    filesystem
+    |> get_adapter()
+    |> has_capability?(:transformable)
+    |> then(fn adapter ->
+      adapter.exists?(filesystem, address)
+    end)
+  end
+
+  @doc """
+  Set the visibility of a file in a filesystem
+
+  ## Examples
+
+  ### Direct filesystem
+
+      filesystem = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
+      :ok = Depot.set_visibility(filesystem, "test.txt", :public)
+
+  ### Module-based filesystem
+
+      defmodule LocalFileSystem do
+        use Depot,
+          adapter: Depot.Adapter.Local,
+          root_path: "/home/user/storage"
+      end
+
+      :ok = LocalFileSystem.set_visibility("test.txt", :public)
+
+  """
+  @spec set_visibility(filesystem, Depot.Address.t() | binary(), Depot.Adapter.visibility()) ::
+          :ok | {:error, term()}
+  def set_visibility(filesystem, address, visibility) do
+    filesystem
+    |> get_adapter()
+    |> has_capability?(:transformable)
+    |> then(fn adapter ->
+      adapter.set_visibility(filesystem, address, visibility)
+    end)
+  end
+
+  @doc """
+  Get the visibility of a file in a filesystem
+
+  ## Examples
+
+  ### Direct filesystem
+
+      filesystem = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
+      {:ok, :public} = Depot.get_visibility(filesystem, "test.txt")
+
+  ### Module-based filesystem
+
+      defmodule LocalFileSystem do
+        use Depot,
+          adapter: Depot.Adapter.Local,
+          root_path: "/home/user/storage"
+      end
+
+      {:ok, :public} = LocalFileSystem.get_visibility("test.txt")
+
+  """
+  @spec get_visibility(filesystem, Depot.Address.t() | binary()) ::
+          {:ok, Depot.Adapter.visibility()} | {:error, term()}
+  def get_visibility(filesystem, address) do
+    filesystem
+    |> get_adapter()
+    |> has_capability?(:transformable)
+    |> then(fn adapter ->
+      adapter.get_visibility(filesystem, address)
+    end)
+  end
+
+  @doc """
+  List contents of a directory in the filesystem
+
+  ## Examples
+
+  ### Direct filesystem
+
+      filesystem = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
+      {:ok, resources} = Depot.list(filesystem, "documents")
+
+  ### Module-based filesystem
+
+      defmodule LocalFileSystem do
+        use Depot,
+          adapter: Depot.Adapter.Local,
+          root_path: "/home/user/storage"
+      end
+
+      {:ok, resources} = LocalFileSystem.list("documents")
+
+  """
+  @spec list(filesystem, Depot.Address.t() | binary()) ::
+          {:ok, [Depot.Resource.t()]} | {:error, term()}
+  def list(filesystem, address) do
+    filesystem
+    |> get_adapter()
+    |> has_capability?(:collection)
+    |> then(fn adapter ->
+      adapter.list(filesystem, address)
+    end)
+  end
+
+  @doc """
+  Create a new directory in the filesystem
+
+  ## Examples
+
+  ### Direct filesystem
+
+      filesystem = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
+      :ok = Depot.create_collection(filesystem, "new_folder")
+
+  ### Module-based filesystem
+
+      defmodule LocalFileSystem do
+        use Depot,
+          adapter: Depot.Adapter.Local,
+          root_path: "/home/user/storage"
+      end
+
+      :ok = LocalFileSystem.create_collection("new_folder")
+
+  """
+  @spec create_collection(filesystem, Depot.Address.t() | binary()) ::
+          :ok | {:error, term()}
+  def create_collection(filesystem, address, opts \\ []) do
+    filesystem
+    |> get_adapter()
+    |> has_capability?(:collection)
+    |> then(fn adapter ->
+      adapter.create_collection(filesystem, address, opts)
+    end)
+  end
+
+  @doc """
+  Delete a directory and its contents from the filesystem
+
+  ## Examples
+
+  ### Direct filesystem
+
+      filesystem = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
+      :ok = Depot.delete_collection(filesystem, "old_folder")
+
+  ### Module-based filesystem
+
+      defmodule LocalFileSystem do
+        use Depot,
+          adapter: Depot.Adapter.Local,
+          root_path: "/home/user/storage"
+      end
+
+      :ok = LocalFileSystem.delete_collection("old_folder")
+
+  """
+  @spec delete_collection(filesystem, Depot.Address.t() | binary(), keyword()) ::
+          :ok | {:error, term()}
+  def delete_collection(filesystem, address, opts \\ []) do
+    filesystem
+    |> get_adapter()
+    |> has_capability?(:collection)
+    |> then(fn adapter ->
+      adapter.delete_collection(filesystem, address, opts)
+    end)
+  end
+
+  @doc """
+  Creates a read stream for a file in the filesystem
+
+  ## Examples
+
+  ### Direct filesystem
+
+      filesystem = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
+      {:ok, stream} = Depot.read_stream(filesystem, "large_file.txt")
+      Enum.each(stream, &IO.puts/1)
+
+  ### Module-based filesystem
+
+      defmodule LocalFileSystem do
+        use Depot,
+          adapter: Depot.Adapter.Local,
+          root_path: "/home/user/storage"
+      end
+
+      {:ok, stream} = LocalFileSystem.read_stream("large_file.txt")
+      Enum.each(stream, &IO.puts/1)
+
+  """
+  @spec read_stream(filesystem, Depot.Address.t() | binary(), Depot.Adapter.stream_opts()) ::
+          {:ok, Enumerable.t()} | {:error, term()}
+  def read_stream(filesystem, address, opts \\ []) do
+    filesystem
+    |> get_adapter()
+    |> has_capability?(:streamable)
+    |> then(fn adapter ->
+      adapter.read_stream(filesystem, address, opts)
+    end)
+  end
+
+  @doc """
+  Creates a write stream for a file in the filesystem
+
+  ## Examples
+
+  ### Direct filesystem
+
+      filesystem = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
+      {:ok, stream} = Depot.write_stream(filesystem, "new_large_file.txt")
+      Enum.into(["Hello", "World"], stream)
+
+  ### Module-based filesystem
+
+      defmodule LocalFileSystem do
+        use Depot,
+          adapter: Depot.Adapter.Local,
+          root_path: "/home/user/storage"
+      end
+
+      {:ok, stream} = LocalFileSystem.write_stream("new_large_file.txt")
+      Enum.into(["Hello", "World"], stream)
+
+  """
+  @spec write_stream(filesystem, Depot.Address.t() | binary(), Depot.Adapter.stream_opts()) ::
+          {:ok, Collectable.t()} | {:error, term()}
+  def write_stream(filesystem, address, opts \\ []) do
+    filesystem
+    |> get_adapter()
+    |> has_capability?(:streamable)
+    |> then(fn adapter ->
+      adapter.write_stream(filesystem, address, opts)
+    end)
+  end
+
+  @doc """
+  Execute a command on a file in the filesystem
+
+  ## Examples
+
+  ### Direct filesystem
+
+      filesystem = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
+      {:ok, result} = Depot.execute(filesystem, "script.sh", ["arg1", "arg2"])
+
+  ### Module-based filesystem
+
+      defmodule LocalFileSystem do
+        use Depot,
+          adapter: Depot.Adapter.Local,
+          root_path: "/home/user/storage"
+      end
+
+      {:ok, result} = LocalFileSystem.execute("script.sh", ["arg1", "arg2"])
+
+  """
+  @spec execute(filesystem, Depot.Address.t() | binary(), term()) ::
+          {:ok, term()} | {:error, term()}
+  def execute(filesystem, address, args) do
+    filesystem
+    |> get_adapter()
+    |> has_capability?(:executable)
+    |> then(fn adapter ->
+      adapter.execute(filesystem, address, args)
+    end)
+  end
+
+  @doc """
+  Mount a filesystem to another filesystem
+
+  ## Examples
+
+  ### Direct filesystem
+
+      source_fs = Depot.Adapter.Local.configure(prefix: "/home/user/source")
+      dest_fs = Depot.Adapter.S3.configure(bucket: "my-bucket")
+      :ok = Depot.mount(source_fs, dest_fs, "mounted")
+
+  ### Module-based filesystem
+
+      defmodule LocalFileSystem do
+        use Depot,
+          adapter: Depot.Adapter.Local,
+          root_path: "/home/user/storage"
+      end
+
+      defmodule S3FileSystem do
+        use Depot,
+          adapter: Depot.Adapter.S3,
+          bucket: "my-bucket"
+      end
+
+      :ok = LocalFileSystem.mount(S3FileSystem, "mounted")
+
+  """
+  @spec mount(filesystem, filesystem, Depot.Address.t() | binary()) ::
+          :ok | {:error, term()}
+  def mount(source_config, destination_config, address) do
+    source_config
+    |> get_adapter()
+    |> has_capability?(:mountable)
+    |> then(fn adapter ->
+      adapter.mount(source_config, destination_config, address)
+    end)
+  end
+
+  @doc """
+  Unmount a filesystem from another filesystem
+
+  ## Examples
+
+  ### Direct filesystem
+
+      filesystem = Depot.Adapter.Local.configure(prefix: "/home/user/storage")
+      :ok = Depot.unmount(filesystem, "mounted")
+
+  ### Module-based filesystem
+
+      defmodule LocalFileSystem do
+        use Depot,
+          adapter: Depot.Adapter.Local,
+          root_path: "/home/user/storage"
+      end
+
+      :ok = LocalFileSystem.unmount("mounted")
+
+  """
+  @spec unmount(filesystem, Depot.Address.t() | binary()) ::
+          :ok | {:error, term()}
+  def unmount(filesystem, address) do
+    filesystem
+    |> get_adapter()
+    |> has_capability?(:mountable)
+    |> then(fn adapter ->
+      adapter.unmount(filesystem, address)
+    end)
+  end
+
+  defp get_adapter({module, _config}) when is_atom(module), do: module
+  defp get_adapter(%struct{} = filesystem) when is_struct(filesystem), do: struct
+
+  defp has_capability?(adapter, capability) do
+    adapter_capabilities = adapter.capabilities()
+
+    if capability in adapter_capabilities do
+      adapter
     else
-      {:error, :unsupported} -> copy_via_local_memory(source, destination, opts)
-      error -> error
+      raise "Adapter #{inspect(adapter)} does not support capability #{inspect(capability)}"
     end
   end
-
-  # different adapter
-  def copy_between_filesystem(source, destination, opts) do
-    copy_via_local_memory(source, destination, opts)
-  end
-
-  defp copy_via_local_memory(
-         {{source_adapter, _} = source_filesystem, source_path},
-         {{destination_adapter, _} = destination_filesystem, destination_path},
-         opts
-       ) do
-    case {Depot.read_stream(source_filesystem, source_path, opts),
-          Depot.write_stream(destination_filesystem, destination_path, opts)} do
-      # A and B support streaming -> Stream data
-      {{:ok, read_stream}, {:ok, write_stream}} ->
-        read_stream
-        |> Stream.into(write_stream)
-        |> Stream.run()
-
-      # Only A support streaming -> Stream to memory and write when done
-      {{:ok, read_stream}, {:error, ^destination_adapter}} ->
-        Depot.write(destination_filesystem, destination_path, Enum.into(read_stream, []))
-
-      # Only B support streaming -> Load into memory and stream to B
-      {{:error, ^source_adapter}, {:ok, write_stream}} ->
-        with {:ok, contents} <- Depot.read(source_filesystem, source_path) do
-          contents
-          |> chunk(Keyword.get(opts, :chunk_size, 5 * 1024))
-          |> Enum.into(write_stream)
-        end
-
-      # Neither support streaming
-      {{:error, ^source_adapter}, {:error, ^destination_adapter}} ->
-        with {:ok, contents} <- Depot.read(source_filesystem, source_path) do
-          Depot.write(destination_filesystem, destination_path, contents)
-        end
-    end
-  rescue
-    e -> {:error, e}
-  end
-
-  @doc false
-  # Also used by the InMemory adapter and therefore not private
-  def chunk("", _size), do: []
-
-  def chunk(binary, size) when byte_size(binary) >= size do
-    {chunk, rest} = :erlang.split_binary(binary, size)
-    [chunk | chunk(rest, size)]
-  end
-
-  def chunk(binary, _size), do: [binary]
 end
